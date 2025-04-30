@@ -1,2 +1,2 @@
 # SOoOS
-Simple Out of Order Simulator
+Simple Out of Order CPU Simulator
