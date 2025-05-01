@@ -4,6 +4,7 @@
 
 #define DEBUG
 #define TEST
+#define DEFAULT_VALUE
 
 #ifdef DEBUG
     #define DEBUG_PRINT(...) do { printf(__VA_ARGS__); } while(0)
@@ -15,29 +16,47 @@ typedef char bool;
 #define TRUE 1
 #define FALSE 0
 
-#define MEM_BASE 0x80
-#define MEM_SIZE 16
-#define MEM_VAL_BASE 0x40
+#ifdef DEFAULT_VALUE
+    int default_reg[] = {0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b};
+    int default_mem[] = {0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49};
+    #define INIT_REG_VAL(i) (default_reg[i])
+    #define INIT_MEM_VAL(i) (default_mem[i])
+#else
+    // increment values from the base
+    #define MEM_VAL_BASE 0x40
+    #define REG_VAL_BASE 0x40
+    #define INIT_REG_VAL(i) (MEM_VAL_BASE + i)
+    #define INIT_MEM_VAL(i) (MEM_VAL_BASE + i)
+#endif
+
+
 #define MAX_COMMIT 2
-#define MAX_ROB_SIZE 8
+#define MAX_RENAME_DISPATCH 2
+#define MAX_INSTR_NUM 32
+
+// default config for RAT version
+#define MEM_BASE 0x80
+#define MEM_SIZE 10
+#define ROB_SIZE 8
 #define REG_FILE_SIZE 12
-#define REG_VAL_BASE 0x40
 #define RAT_SIZE 8
-#define ALU_PIPELINE_SIZE 1
-#define LOAD_PIPELINE_SIZE 1
-#define STORE_PIPELINE_SIZE 1
+#define ALU_PORT_NUM 1
+#define LOAD_PORT_NUM 1
+#define STORE_PORT_NUM 1
 #define STORE_BUF_SIZE 4
 #define COMPLETED_LOAD_BUF_SIZE 4
 #define INSTR_WINDOW_SIZE 4
-#define MAX_INSTR_NUM 32
 
-#define INIT_ZERO(NAME) memset(NAME, 0, sizeof(NAME))
+#define INVALID_ENTRY(buf, idx) do {           \
+    memset((buf) + (idx), 0, sizeof((buf)[0]));\
+} while(0)                                     \
 
-#define REMOVE_ENTRY(buf, idx, buf_size) do { \
-    for(int _i = (idx); _i < (buf_size) - 1; _i++) { \
-        buf[_i] = buf[_i + 1];                \
-    }                                       \
-} while(0)                                  \
+#define REMOVE_ENTRY(buf, idx, buf_size) do {           \
+    for(int _i = (idx); _i < (buf_size) - 1; _i++) {    \
+        buf[_i] = buf[_i + 1];                          \
+    }                                                   \
+    INVALID_ENTRY(buf, (buf_size) - 1);                 \
+} while(0)                                              \
 
 #define LINE(n) (line_buf + sizeof(line_buf) - (n))
 #define SPACE(n) (space_buf + sizeof(space_buf) - (n))
@@ -74,7 +93,6 @@ enum instr_type {
     SUB,
     AND,
     OR,
-    XOR,
     NOT,
     LOAD,
     STORE,
@@ -104,19 +122,18 @@ int front_rat[RAT_SIZE], back_rat[RAT_SIZE];
 int mem[MEM_SIZE];
 
 struct reg_file_entry reg_file[REG_FILE_SIZE];
-struct rob_entry rob[MAX_ROB_SIZE];
+struct rob_entry rob[ROB_SIZE];
 struct instr_window_entry instr_window[INSTR_WINDOW_SIZE];
 struct instr icache[MAX_INSTR_NUM + 1];
 
-struct pipeline_entry alu_pipeline[ALU_PIPELINE_SIZE];
-struct pipeline_entry load_pipeline[LOAD_PIPELINE_SIZE];
-struct pipeline_entry store_pipeline[STORE_PIPELINE_SIZE];
+struct pipeline_entry alu_pipeline[ALU_PORT_NUM];
+struct pipeline_entry load_pipeline[LOAD_PORT_NUM];
+struct pipeline_entry store_pipeline[STORE_PORT_NUM];
 struct pipeline_entry store_buffer[STORE_BUF_SIZE];
 struct pipeline_entry completed_load_buffer[COMPLETED_LOAD_BUF_SIZE];
 
 bool should_flush = FALSE;
 int fault_ia = 0;
-
 int instr_window_num = 0;
 int finished_store = 0;
 int committed_store = 0;
@@ -142,24 +159,13 @@ void invalidate_pipeline_entry(struct pipeline_entry *e) {
 }
 
 void init() {
-    INIT_ZERO(mem);
-    INIT_ZERO(icache);
-    INIT_ZERO(reg_file);
-    INIT_ZERO(rob);
-    INIT_ZERO(front_rat);
-    INIT_ZERO(back_rat);
-    INIT_ZERO(alu_pipeline);
-    INIT_ZERO(store_pipeline);
-    INIT_ZERO(load_pipeline);
-    INIT_ZERO(store_buffer);
-    INIT_ZERO(completed_load_buffer);
-
+    // since we use global variables, there is no need to zeroize them now.
     for(int i = 0; i < MEM_SIZE; i++) {
-        mem[i] = MEM_VAL_BASE + i;
+        mem[i] = INIT_MEM_VAL(i);
     }
 
     for(int i = 0; i < REG_FILE_SIZE; i++){
-        reg_file[i].data = REG_VAL_BASE + i;
+        reg_file[i].data = INIT_REG_VAL(i);
         if (i < RAT_SIZE) {
             front_rat[i] = i;
             back_rat[i] = i;
@@ -174,61 +180,65 @@ void init() {
 
 void flush() {
     printf("[Flush] start flushing with fault IA %d\n", fault_ia);
-    for (int i = 0; i < MAX_ROB_SIZE; i++) {
-        if (rob[i].busy && rob[i].s) {
-            if (rob[i].tag != -1) {
-                reg_file[rob[i].tag].busy = FALSE;
-                reg_file[rob[i].tag].valid = FALSE;
-                reg_file[rob[i].tag].reg = -1;
-            }
+    for (int i = 0; i < ROB_SIZE; i++) {
+        if (!rob[i].busy || !rob[i].s) {
+            continue;
+        }
 
-            rob[i].busy = FALSE;
+        if (rob[i].tag != -1)
+            INVALID_ENTRY(reg_file, rob[i].tag);
+
+        if (rob[i].instr_addr == fault_ia)
+            rob_tail = i;
+            
+        INVALID_ENTRY(rob, i);
             rob_size--;
 
-            if (rob[i].instr_addr == fault_ia)
-                rob_tail = i;
-
-            if (rob_size == 0)
-                rob_head = rob_tail = 0;
-        }
+        if (rob_size == 0)
+            rob_head = rob_tail = 0;
     }
 
     for (int i = 0; i < completed_load; i++) {
         if (completed_load_buffer[i].instr_addr >= fault_ia) {
+            printf("[Flush] flush completed load buffer IA %d\n", completed_load_buffer[i].instr_addr);
             REMOVE_ENTRY(completed_load_buffer, i, completed_load);
-            invalidate_pipeline_entry(&completed_load_buffer[completed_load - 1]);
             completed_load--;
         }
     }
 
     for (int i = 0; i < finished_store; i++) {
         if (store_buffer[i].instr_addr >= fault_ia) {
+            printf("[Flush] flush store buffer IA %d\n", store_buffer[i].instr_addr);
             REMOVE_ENTRY(store_buffer, i, finished_store);
-            invalidate_pipeline_entry(&store_buffer[finished_store - 1]);
             finished_store--;
         }
     }
 
-    for (int i = 0; i < ALU_PIPELINE_SIZE; i++) {
-        if (alu_pipeline[i].instr_addr >= fault_ia)
+    for (int i = 0; i < ALU_PORT_NUM; i++) {
+        if (alu_pipeline[i].instr_addr >= fault_ia) {
+            printf("[Flush] flush alu pipeline IA %d\n", alu_pipeline[i].instr_addr);
             invalidate_pipeline_entry(&alu_pipeline[i]);
+        }
     }
 
-    for (int i = 0; i < STORE_PIPELINE_SIZE; i++) {
-        if (store_pipeline[i].instr_addr >= fault_ia)
+    for (int i = 0; i < STORE_PORT_NUM; i++) {
+        if (store_pipeline[i].instr_addr >= fault_ia) {
+            printf("[Flush] flush store pipeline IA %d\n", store_pipeline[i].instr_addr);
             invalidate_pipeline_entry(&store_pipeline[i]);
+        }
     }
 
-    for (int i = 0; i < LOAD_PIPELINE_SIZE; i++) {
-        if (load_pipeline[i].instr_addr >= fault_ia)
+    for (int i = 0; i < LOAD_PORT_NUM; i++) {
+        if (load_pipeline[i].instr_addr >= fault_ia) {
+            printf("[Flush] flush load pipeline IA %d\n", store_pipeline[i].instr_addr);
             invalidate_pipeline_entry(&load_pipeline[i]);
+        }
     }
 
     for (int i = 0; i < instr_window_num; i++) {
         if (instr_window[i].instr_addr >= fault_ia) {
+            printf("[Flush] flush instruction window IA %d\n", instr_window[i].instr_addr);
             REMOVE_ENTRY(instr_window, i, instr_window_num);
-            instr_window[instr_window_num - 1].busy = FALSE;
-            instr_window[instr_window_num - 1].instr_addr = 0;
             instr_window_num--;
         }
     }
@@ -255,41 +265,47 @@ void mark_speculative(int instr_addr) {
             printf("[Retire] mark rob IA %d speculative\n", rob[i].instr_addr);
         }
 
-        i = (i + 1) % MAX_ROB_SIZE;
+        i = (i + 1) % ROB_SIZE;
     }
 
     fault_ia = instr_addr;
 }
 
-void commit_store_or_load(int instr_addr) {
+void commit_mem_instr(int instr_addr) {
     for(int i = 0; i < finished_store; i++) {
-        if(store_buffer[i].instr_addr == instr_addr) {
-            struct pipeline_entry e = store_buffer[i];
-            REMOVE_ENTRY(store_buffer, i, finished_store + committed_store);
-            store_buffer[finished_store + committed_store - 1] = e;
-            finished_store--;
-            committed_store++;
-            for(int j = 0; j < completed_load; j++) {
-                if (completed_load_buffer[i].addr == e.addr && completed_load_buffer[i].instr_addr > e.instr_addr) {
-                    should_flush = TRUE;
-                    mark_speculative(completed_load_buffer[i].instr_addr);
-                }
-            }
-            printf("[Retire] commit finished store IA %d\n", instr_addr);
-            break;
+        if(store_buffer[i].instr_addr != instr_addr) {
+            continue;
         }
+
+        struct pipeline_entry e = store_buffer[i];
+        REMOVE_ENTRY(store_buffer, i, finished_store + committed_store);
+        store_buffer[finished_store + committed_store - 1] = e;
+        finished_store--;
+        committed_store++;
+
+        for(int j = 0; j < completed_load; j++) {
+            if (completed_load_buffer[i].addr == e.addr && completed_load_buffer[i].instr_addr > e.instr_addr) {
+                should_flush = TRUE;
+                mark_speculative(completed_load_buffer[i].instr_addr);
+            }     
+        }
+        
+        printf("[Retire] commit finished store IA %d\n", instr_addr);
+        break;
     }
 
     for(int i = 0; i < completed_load; i++) {
-        if (completed_load_buffer[i].instr_addr == instr_addr) {
-            printf("[Retire] commit completed load IA %d\n", instr_addr);
-            invalidate_pipeline_entry(&completed_load_buffer[i]);
-            break;
+        if (completed_load_buffer[i].instr_addr != instr_addr) {
+            continue;
         }
+
+        printf("[Retire] commit completed load IA %d\n", instr_addr);
+        invalidate_pipeline_entry(&completed_load_buffer[i]);
+        break;
     }
 }
 
-void store_mem() {
+void flush_committed_store() {
     if (committed_store != 0)
         printf("[Retire] commit %d store to cache\n", committed_store);
 
@@ -306,7 +322,7 @@ void store_mem() {
 }
 
 void retire() {
-    store_mem();
+    flush_committed_store();
 
     for(int i = 0; i < MAX_COMMIT && rob[rob_head].finished && rob[rob_head].busy && !rob[rob_head].s; i++) {
         int target_reg = reg_file[rob[rob_head].tag].reg;
@@ -322,16 +338,16 @@ void retire() {
             reg_file[evicted_tag].valid = FALSE;
         }
           
-        commit_store_or_load(rob[rob_head].instr_addr);
-        memset(&rob[rob_head], 0, sizeof(struct rob_entry));
+        commit_mem_instr(rob[rob_head].instr_addr);
+        INVALID_ENTRY(rob, rob_head);
 
-        rob_head = (rob_head + 1) % MAX_ROB_SIZE;
+        rob_head = (rob_head + 1) % ROB_SIZE;
         rob_size--;
     }
 }
 
 void complete_alu() {
-    for (int i = 0; i < ALU_PIPELINE_SIZE; i++) {
+    for (int i = 0; i < ALU_PORT_NUM; i++) {
         if(!alu_pipeline[i].instr_addr)
             continue;
 
@@ -349,7 +365,7 @@ void complete_alu() {
 }
 
 void complete_mem() {
-    for(int i = 0; i < STORE_PIPELINE_SIZE && finished_store + committed_store < COMPLETED_LOAD_BUF_SIZE; i++) {
+    for(int i = 0; i < STORE_PORT_NUM && finished_store + committed_store < COMPLETED_LOAD_BUF_SIZE; i++) {
         if(!store_pipeline[i].instr_addr)
             continue;
         printf("[Complete] Update ROB IA %d finished\n", store_pipeline[i].instr_addr);
@@ -358,7 +374,7 @@ void complete_mem() {
         store_buffer[finished_store++] = store_pipeline[i];
         invalidate_pipeline_entry(&store_pipeline[i]);       
     }
-    for(int i = 0; i < LOAD_PIPELINE_SIZE && completed_load < COMPLETED_LOAD_BUF_SIZE; i++) {
+    for(int i = 0; i < LOAD_PORT_NUM && completed_load < COMPLETED_LOAD_BUF_SIZE; i++) {
         if(!load_pipeline[i].instr_addr)
             continue;
         printf("[Complete] validate Register File $%d with result 0x%x\n", load_pipeline[i].tag, load_pipeline[i].val);
@@ -393,7 +409,7 @@ void issue_alu(int i){
         default: break;
     }
 
-    for(int j = 0; j < ALU_PIPELINE_SIZE; j++) {
+    for(int j = 0; j < ALU_PORT_NUM; j++) {
         if(!alu_pipeline[j].instr_addr) {
             alu_pipeline[j].instr_addr = instr_window[i].instr_addr;
             alu_pipeline[j].val = result;
@@ -418,7 +434,7 @@ int load_forward(int addr) {
 
 void issue_mem(int i){
     if (instr_window[i].instr == STORE) {
-        for(int j = 0; j < STORE_PIPELINE_SIZE; j++) {
+        for(int j = 0; j < STORE_PORT_NUM; j++) {
             if(!store_pipeline[j].instr_addr) {
                 printf("[Issue] issue IA %d to store pipeline %d\n", instr_window[i].instr_addr, j);
                 store_pipeline[j].instr_addr = instr_window[i].instr_addr;
@@ -430,7 +446,7 @@ void issue_mem(int i){
             }
         }
     } else {
-        for(int j = 0; j < LOAD_PIPELINE_SIZE; j++) {
+        for(int j = 0; j < LOAD_PORT_NUM; j++) {
             if(!load_pipeline[j].instr_addr) {
                 printf("[Issue] issue IA %d to load pipeline %d\n", instr_window[i].instr_addr, j);
                 load_pipeline[j].instr_addr = instr_window[i].instr_addr;
@@ -470,13 +486,13 @@ void issue() {
 
             rob[instr_window[i].rob_i].issued = TRUE;
             
-            if(instr_window[i].instr == STORE && issued_store < STORE_PIPELINE_SIZE) {
+            if(instr_window[i].instr == STORE && issued_store < STORE_PORT_NUM) {
                 issued_store++;
                 issue_mem(i);
-            } else if (instr_window[i].instr == LOAD && issued_load < LOAD_PIPELINE_SIZE) {
+            } else if (instr_window[i].instr == LOAD && issued_load < LOAD_PORT_NUM) {
                 issued_load++;
                 issue_mem(i);
-            } else if (issued_alu < ALU_PIPELINE_SIZE){
+            } else if (issued_alu < ALU_PORT_NUM){
                 issued_alu++;
                 issue_alu(i);
             } else {
@@ -499,6 +515,7 @@ int next_tag() {
         if (reg_file[i].valid == FALSE && reg_file[i].busy == FALSE)
             return i;
     }
+
     return -1;
 }
 
@@ -513,7 +530,7 @@ void rename_dispatch() {
         return;
     }
 
-    if (rob_size == MAX_ROB_SIZE) {
+    if (rob_size == ROB_SIZE) {
         DEBUG_PRINT("[Debug] rob full\n");
         return;
     }
@@ -528,7 +545,7 @@ void rename_dispatch() {
     if (instr.type != STORE) {
         tag = next_tag();
         if(tag == -1) {
-            DEBUG_PRINT("[Debug] reg file full\n");
+            printf("[Rename] reg file full for IA %d\n", pc);
             return;
         }
         printf("[Rename] allocate Tag %d to IA %d with Reg %d\n", tag, pc, instr.dst);
@@ -557,7 +574,7 @@ void rename_dispatch() {
     rob[i].instr_addr = pc;
     rob[i].tag = tag;
     rob[i].s = FALSE;
-    rob_tail = (rob_tail + 1) % MAX_ROB_SIZE;
+    rob_tail = (rob_tail + 1) % ROB_SIZE;
     rob_size++;
     pc++;
 }
@@ -630,47 +647,44 @@ void load_instrs() {
     putchar('\n');
 }
 
-void print_reg_file() {
+void print_reg() {
     putchar('\n');
-    printf("%s[Physical Register File]\n", SPACE(8));
-    printf("%s%s\n", SPACE(8), LINE(24));
-    printf("%s|TAG|Reg| Data|  V|  B|\n", SPACE(8));
-    printf("%s%s\n", SPACE(8), LINE(24));
+    printf("%s[Front End RAT]%s[Back End RAT]%s[Physical Register File]\n", SPACE(4), SPACE(7), SPACE(8));
+    printf("%s%s%s%s%s%s\n", SPACE(4), LINE(15), SPACE(8), LINE(15), SPACE(8), LINE(24));
+    printf("%s|REG|     TAG|%s|REG|     TAG|%s|TAG|Reg| Data|  V|  B|\n", SPACE(4), SPACE(8), SPACE(8));
+    printf("%s%s%s%s%s%s\n", SPACE(4), LINE(15), SPACE(8), LINE(15), SPACE(8), LINE(24));
+
     for(int i = 0; i < REG_FILE_SIZE; i++) {
+        if (i < RAT_SIZE) {
+            printf("%s|$%-2d|%8d|%s|$%-2d|%8d|", SPACE(4), i, front_rat[i], SPACE(8), i, back_rat[i]);
+        } else {
+            printf("%s", SPACE(39));
+        }
+
         struct reg_file_entry e = reg_file[i];
         printf("%s|%3d|%3d|%#5x|%3d|%3d|\n", SPACE(8), i, e.reg, e.data, e.valid, e.busy);
-        printf("%s%s\n", SPACE(8), LINE(24));
+        printf("%s%s%s%s", SPACE(4), i < RAT_SIZE ? LINE(15) : SPACE(15), SPACE(8), i < RAT_SIZE ? LINE(15) : SPACE(15));    
+        printf("%s%s\n",SPACE(8), LINE(24));
     }
-}
 
-void print_rat() {
-    putchar('\n');
-    printf("%s[Front End RAT]%s[Back End RAT]\n", SPACE(4), SPACE(8));
-    printf("%s%s%s%s\n", SPACE(4), LINE(15), SPACE(8), LINE(15));
-    printf("%s|REG|     TAG|%s|REG|     TAG|\n", SPACE(4), SPACE(8));
-    printf("%s%s%s%s\n", SPACE(4), LINE(15), SPACE(8), LINE(15));
-    for(int i = 0; i < RAT_SIZE; i++) {   
-        printf("%s|$%-2d|%8d|%s|$%-2d|%8d|\n", SPACE(4), i, front_rat[i], SPACE(8), i, back_rat[i]);
-        printf("%s%s%s%s\n", SPACE(4), LINE(15), SPACE(8), LINE(15));
-    }
     putchar('\n');
 }
 
 #define PRINT_ROB_ROW(NAME, FIELD) do {          \
     printf("%s%s", SPACE(8), NAME);              \
-    for(int i = 0; i < MAX_ROB_SIZE; i++) {      \
+    for(int i = 0; i < ROB_SIZE; i++) {      \
         if (rob[i].busy)                         \
             printf("%2d|", rob[i].FIELD);        \
         else                                     \
             printf("  |");                       \
     }                                            \
-    printf("\n%s%s\n", SPACE(8), LINE(3 * (MAX_ROB_SIZE + 2)));\
+    printf("\n%s%s\n", SPACE(8), LINE(3 * (ROB_SIZE + 2)));\
 } while(0)                                       \
 
 void print_rob() {
     putchar('\n');
-    printf("%s[ROB]\n", SPACE(8 + 3 * MAX_ROB_SIZE / 2));
-    printf("%s%s\n", SPACE(8), LINE(3 * (MAX_ROB_SIZE + 2)));
+    printf("%s[ROB]\n", SPACE(8 + 3 * ROB_SIZE / 2));
+    printf("%s%s\n", SPACE(8), LINE(3 * (ROB_SIZE + 2)));
 
     PRINT_ROB_ROW("|  B|", busy);
     PRINT_ROB_ROW("|  I|", issued);
@@ -703,7 +717,7 @@ void print_pipeline() {
     putchar('\n');
     printf("%s[ALU Pipeline]%s[Store Pipeline]%s[Load Pipeline]\n", SPACE(12), SPACE(17), SPACE(19));
     
-    for(int i = 0; i < ALU_PIPELINE_SIZE; i++) {
+    for(int i = 0; i < ALU_PORT_NUM; i++) {
         printf("%s%s%s%s%s%s\n", SPACE(8), LINE(24), SPACE(8), LINE(25), SPACE(8), LINE(29));
         printf("%s|stage|IA|TAG|(Result)|%s|stage|IA|(Addr)|(Data)|%s|stage|IA|TAG|(Addr)|(Data)|\n", SPACE(8), SPACE(8), SPACE(8));
         printf("%s%s%s%s%s%s\n", SPACE(8), LINE(24), SPACE(8), LINE(25), SPACE(8), LINE(29));
@@ -763,10 +777,9 @@ void print_mem_and_buffer() {
 }
 
 void print_info() {
-    print_instr_window();
     print_rob();
-    print_rat();
-    print_reg_file();
+    print_instr_window();
+    print_reg();
     print_pipeline();
     print_mem_and_buffer();
 }
@@ -788,21 +801,23 @@ void simulate_cycle(bool delay_flush) {
 
     complete();
     issue();
-    rename_dispatch();
-    rename_dispatch();
+    
+    for (int i = 0; i < MAX_RENAME_DISPATCH; i++) {
+        rename_dispatch();
+        rename_dispatch();
+    }
 }
 
 void test() {
-    store_mem();
-
+    flush_committed_store();
     int reg[RAT_SIZE];
     int mem_temp[MEM_SIZE];
 
     for (int i = 0; i < RAT_SIZE; i++)
-        reg[i] = REG_VAL_BASE + i;
+        reg[i] = INIT_REG_VAL(i);
 
     for (int i = 0; i < MEM_SIZE; i++)
-        mem_temp[i] = MEM_VAL_BASE + i;
+        mem_temp[i] = INIT_MEM_VAL(i);
 
     for (int i = 1; i <= instr_num; i++) {
         int dst = icache[i].dst, src1 = icache[i].src1, src2 = icache[i].src2, off = icache[i].offset;
@@ -836,6 +851,7 @@ void test() {
 
 int main() {
     init();
+
     load_instrs();
     printf("press enter to continue..");
     getchar();
@@ -844,12 +860,12 @@ int main() {
     bool delay_flush = FALSE;
     bool clear_terminal = TRUE;
     while(pc <= instr_num || rob_size != 0) {
-        if (clear_terminal) {
+        #ifdef DEBUG
             system("clear");
             system("clear");
-        }
+        #endif
 
-        printf("%s\n\n#CYCLE %d\n\n", LINE(64), cycle);
+        printf("%s\n\n#CYCLE %d, pc = %d\n\n", LINE(64), cycle, pc);
 
         simulate_cycle(delay_flush);
 
@@ -865,6 +881,6 @@ int main() {
     printf("End of Simulation\n");
     
     #ifdef TEST
-    test();
+        test();
     #endif
 }

@@ -3,9 +3,9 @@
 all: main
 
 main: main.c
-	gcc -o simulator main.c
+	gcc -o SOoOS main.c
 
 run: clean main
-	./simulator
+	./SOoOS
 clean:
-	rm -f main
+	rm -f SOoOS
