@@ -44,7 +44,7 @@ typedef char bool;
     #define DEBUG_PRINT(...) do { } while(0)
 #endif                                                                      
 
-#define INVALID_ENTRY(buf, idx) do {           \
+#define INVALIDATE_ENTRY(buf, idx) do {           \
     memset((buf) + (idx), 0, sizeof((buf)[0]));\
 } while(0)                                     \
 
@@ -52,7 +52,7 @@ typedef char bool;
     for(int _i = (idx); _i < (buf_size) - 1; _i++) {    \
         buf[_i] = buf[_i + 1];                          \
     }                                                   \
-    INVALID_ENTRY(buf, (buf_size) - 1);                 \
+    INVALIDATE_ENTRY(buf, (buf_size) - 1);                 \
 } while(0)                                              \
 
 #define LINE(n) (line_buf + sizeof(line_buf) - (n))
@@ -64,27 +64,19 @@ struct rob_entry {
     bool busy;
     bool issued;
     bool finished;
-    int instr_addr;
+    int ia;
     int tag;
     bool s;
 };
 
-struct reg_file_entry {
+struct reg_entry {
     int reg;
     int data;
     bool valid;
     bool busy;
 };
 
-struct pipeline_entry {
-    int instr_addr;
-    int tag;
-    int val;
-    int addr;
-    int rob_i;
-};
-
-enum instr_type {
+enum opcodes {
     NOP,
     ADD,
     SUB,
@@ -95,39 +87,34 @@ enum instr_type {
     STORE,
 };
 
-struct instr_window_entry {
-    int instr_addr;
-    int out_tag;
-    int instr;
-    int op1;
-    int op2;
+struct instr_entry {
+    int ia;
+    int tag;
+    int opcode;
+    int dst;
+    int src1;
+    int src2;
     int off;
+    int addr;
+    int val;
     bool busy;
     bool ready;
     int rob_i;
 };
 
-struct instr {
-    int type;
-    int dst;
-    int src1;
-    int src2;
-    int offset;
-};
-
 int front_rat[RAT_SIZE], back_rat[RAT_SIZE];
 int mem[MEM_SIZE];
 
-struct reg_file_entry reg_file[REG_FILE_SIZE];
+struct reg_entry reg_file[REG_FILE_SIZE];
 struct rob_entry rob[ROB_SIZE];
-struct instr_window_entry instr_window[INSTR_WINDOW_SIZE];
-struct instr icache[MAX_INSTR_NUM + 1];
 
-struct pipeline_entry alu_pipeline[ALU_PORT_NUM];
-struct pipeline_entry load_pipeline[LOAD_PORT_NUM];
-struct pipeline_entry store_pipeline[STORE_PORT_NUM];
-struct pipeline_entry store_buffer[STORE_BUF_SIZE];
-struct pipeline_entry completed_load_buffer[COMPLETED_LOAD_BUF_SIZE];
+struct instr_entry instr_window[INSTR_WINDOW_SIZE];
+struct instr_entry icache[MAX_INSTR_NUM + 1];
+struct instr_entry alu_pipeline[ALU_PORT_NUM];
+struct instr_entry load_pipeline[LOAD_PORT_NUM];
+struct instr_entry store_pipeline[STORE_PORT_NUM];
+struct instr_entry store_buffer[STORE_BUF_SIZE];
+struct instr_entry completed_load_buffer[COMPLETED_LOAD_BUF_SIZE];
 
 bool should_flush = FALSE;
 int fault_ia = 0;
@@ -149,10 +136,6 @@ char* type_to_str(int type) {
         case OR: return "or";
         default: return "";
     }
-}
-
-void invalidate_pipeline_entry(struct pipeline_entry *e) {
-    memset(e, 0, sizeof(struct pipeline_entry));
 }
 
 void init() {
@@ -177,69 +160,75 @@ void init() {
 
 void flush() {
     printf("[Flush] start flushing with fault IA %d\n", fault_ia);
+
     for (int i = 0; i < ROB_SIZE; i++) {
         if (!rob[i].busy || !rob[i].s) {
             continue;
         }
 
-        if (rob[i].tag != -1)
-            INVALID_ENTRY(reg_file, rob[i].tag);
+        printf("[Flush] flush rob entry IA %d\n", rob[i].ia);
 
-        if (rob[i].instr_addr == fault_ia)
+        if (rob[i].tag != -1) {
+            printf("[Flush] flush reg file $%d\n", rob[i].tag);
+            INVALIDATE_ENTRY(reg_file, rob[i].tag);
+        }
+
+        if (rob[i].ia == fault_ia)
             rob_tail = i;
             
-        INVALID_ENTRY(rob, i);
-            rob_size--;
+        INVALIDATE_ENTRY(rob, i);
+        rob_size--;
 
         if (rob_size == 0)
             rob_head = rob_tail = 0;
     }
 
     for (int i = 0; i < completed_load; i++) {
-        if (completed_load_buffer[i].instr_addr >= fault_ia) {
-            printf("[Flush] flush completed load buffer IA %d\n", completed_load_buffer[i].instr_addr);
+        if (completed_load_buffer[i].ia >= fault_ia) {
+            printf("[Flush] flush completed load buffer IA %d\n", completed_load_buffer[i].ia);
             REMOVE_ENTRY(completed_load_buffer, i, completed_load);
             completed_load--;
         }
     }
 
     for (int i = 0; i < finished_store; i++) {
-        if (store_buffer[i].instr_addr >= fault_ia) {
-            printf("[Flush] flush store buffer IA %d\n", store_buffer[i].instr_addr);
+        if (store_buffer[i].ia >= fault_ia) {
+            printf("[Flush] flush store buffer IA %d\n", store_buffer[i].ia);
             REMOVE_ENTRY(store_buffer, i, finished_store);
             finished_store--;
         }
     }
 
     for (int i = 0; i < ALU_PORT_NUM; i++) {
-        if (alu_pipeline[i].instr_addr >= fault_ia) {
-            printf("[Flush] flush alu pipeline IA %d\n", alu_pipeline[i].instr_addr);
-            invalidate_pipeline_entry(&alu_pipeline[i]);
+        if (alu_pipeline[i].ia >= fault_ia) {
+            printf("[Flush] flush alu pipeline IA %d\n", alu_pipeline[i].ia);
+            INVALIDATE_ENTRY(alu_pipeline, i);
         }
     }
 
     for (int i = 0; i < STORE_PORT_NUM; i++) {
-        if (store_pipeline[i].instr_addr >= fault_ia) {
-            printf("[Flush] flush store pipeline IA %d\n", store_pipeline[i].instr_addr);
-            invalidate_pipeline_entry(&store_pipeline[i]);
+        if (store_pipeline[i].ia >= fault_ia) {
+            printf("[Flush] flush store pipeline IA %d\n", store_pipeline[i].ia);
+            INVALIDATE_ENTRY(store_pipeline, i);
         }
     }
 
     for (int i = 0; i < LOAD_PORT_NUM; i++) {
-        if (load_pipeline[i].instr_addr >= fault_ia) {
-            printf("[Flush] flush load pipeline IA %d\n", store_pipeline[i].instr_addr);
-            invalidate_pipeline_entry(&load_pipeline[i]);
+        if (load_pipeline[i].ia >= fault_ia) {
+            printf("[Flush] flush load pipeline IA %d\n", store_pipeline[i].ia);
+            INVALIDATE_ENTRY(load_pipeline, i);
         }
     }
 
     for (int i = 0; i < instr_window_num; i++) {
-        if (instr_window[i].instr_addr >= fault_ia) {
-            printf("[Flush] flush instruction window IA %d\n", instr_window[i].instr_addr);
+        if (instr_window[i].ia >= fault_ia) {
+            printf("[Flush] flush instruction window IA %d\n", instr_window[i].ia);
             REMOVE_ENTRY(instr_window, i, instr_window_num);
             instr_window_num--;
         }
     }
 
+    printf("[Flush] front end RAT\n");
     for (int i = 0; i < RAT_SIZE; i++) {
         front_rat[i] = back_rat[i];
     }
@@ -251,7 +240,7 @@ void flush() {
 void mark_speculative(int instr_addr) {
     bool start = FALSE;
     for(int n = 0, i = rob_head; n < rob_size; n++) {
-        if (rob[i].busy && rob[i].instr_addr == instr_addr) {
+        if (rob[i].busy && rob[i].ia == instr_addr) {
             if (rob[i].s)
                 return;
             start = TRUE;
@@ -259,7 +248,7 @@ void mark_speculative(int instr_addr) {
 
         if (start) {
             rob[i].s = TRUE;
-            printf("[Retire] mark rob IA %d speculative\n", rob[i].instr_addr);
+            printf("[Retire] mark rob IA %d speculative\n", rob[i].ia);
         }
 
         i = (i + 1) % ROB_SIZE;
@@ -270,20 +259,20 @@ void mark_speculative(int instr_addr) {
 
 void commit_mem_instr(int instr_addr) {
     for(int i = 0; i < finished_store; i++) {
-        if(store_buffer[i].instr_addr != instr_addr) {
+        if(store_buffer[i].ia != instr_addr) {
             continue;
         }
 
-        struct pipeline_entry e = store_buffer[i];
+        struct instr_entry e = store_buffer[i];
         REMOVE_ENTRY(store_buffer, i, finished_store + committed_store);
         store_buffer[finished_store + committed_store - 1] = e;
         finished_store--;
         committed_store++;
 
         for(int j = 0; j < completed_load; j++) {
-            if (completed_load_buffer[i].addr == e.addr && completed_load_buffer[i].instr_addr > e.instr_addr) {
+            if (completed_load_buffer[i].addr == e.addr && completed_load_buffer[i].ia > e.ia) {
                 should_flush = TRUE;
-                mark_speculative(completed_load_buffer[i].instr_addr);
+                mark_speculative(completed_load_buffer[i].ia);
             }     
         }
         
@@ -292,12 +281,12 @@ void commit_mem_instr(int instr_addr) {
     }
 
     for(int i = 0; i < completed_load; i++) {
-        if (completed_load_buffer[i].instr_addr != instr_addr) {
+        if (completed_load_buffer[i].ia != instr_addr) {
             continue;
         }
 
         printf("[Retire] commit completed load IA %d\n", instr_addr);
-        invalidate_pipeline_entry(&completed_load_buffer[i]);
+        INVALIDATE_ENTRY(completed_load_buffer, i);
         break;
     }
 }
@@ -312,7 +301,7 @@ void flush_committed_store() {
 
         mem[addr - MEM_BASE] = val;
         printf("[Retire] store %#x to address %#x\n", val, addr);
-        invalidate_pipeline_entry(&store_buffer[finished_store + i]);
+        INVALIDATE_ENTRY(store_buffer, finished_store + i);
     }
 
     committed_store = 0;
@@ -325,18 +314,18 @@ void retire() {
         int target_reg = reg_file[rob[rob_head].tag].reg;
         int evicted_tag = back_rat[target_reg];
 
-        printf("[Retire] retire ROB IA %d\n", rob[rob_head].instr_addr);
+        printf("[Retire] retire ROB IA %d\n", rob[rob_head].ia);
        
         if(rob[rob_head].tag != -1) {
-            printf("[Retire] Back End RAT $%d with new tag %d\n", target_reg, rob[rob_head].tag);
+            printf("[Retire] back end RAT $%d updated with new tag %d\n", target_reg, rob[rob_head].tag);
             printf("[Retire] invalidate Physical Register File $%d\n", evicted_tag);
             back_rat[target_reg] = rob[rob_head].tag;
             reg_file[evicted_tag].busy = FALSE;
             reg_file[evicted_tag].valid = FALSE;
         }
           
-        commit_mem_instr(rob[rob_head].instr_addr);
-        INVALID_ENTRY(rob, rob_head);
+        commit_mem_instr(rob[rob_head].ia);
+        INVALIDATE_ENTRY(rob, rob_head);
 
         rob_head = (rob_head + 1) % ROB_SIZE;
         rob_size--;
@@ -345,7 +334,7 @@ void retire() {
 
 void complete_alu() {
     for (int i = 0; i < ALU_PORT_NUM; i++) {
-        if(!alu_pipeline[i].instr_addr)
+        if(!alu_pipeline[i].ia)
             continue;
 
         printf("[Complete] validate Register File $%d with result %#x\n", alu_pipeline[i].tag, alu_pipeline[i].val);
@@ -354,25 +343,26 @@ void complete_alu() {
         reg_file[alu_pipeline[i].tag].data = alu_pipeline[i].val;
         
         //Update ROB
-        printf("[Complete] update ROB IA %d finished\n", alu_pipeline[i].instr_addr);
+        printf("[Complete] update ROB IA %d finished\n", alu_pipeline[i].ia);
         rob[alu_pipeline[i].rob_i].finished = TRUE;
 
-        invalidate_pipeline_entry(&alu_pipeline[i]);
+        INVALIDATE_ENTRY(alu_pipeline, i);
     }
 }
 
 void complete_mem() {
     for(int i = 0; i < STORE_PORT_NUM && finished_store + committed_store < COMPLETED_LOAD_BUF_SIZE; i++) {
-        if(!store_pipeline[i].instr_addr)
+        if(!store_pipeline[i].ia)
             continue;
-        printf("[Complete] Update ROB IA %d finished\n", store_pipeline[i].instr_addr);
+        printf("[Complete] Update ROB IA %d finished\n", store_pipeline[i].ia);
         rob[store_pipeline[i].rob_i].finished = TRUE;
 
         store_buffer[finished_store++] = store_pipeline[i];
-        invalidate_pipeline_entry(&store_pipeline[i]);       
+        INVALIDATE_ENTRY(store_pipeline, i);      
     }
+
     for(int i = 0; i < LOAD_PORT_NUM && completed_load < COMPLETED_LOAD_BUF_SIZE; i++) {
-        if(!load_pipeline[i].instr_addr)
+        if(!load_pipeline[i].ia)
             continue;
         printf("[Complete] validate Register File $%d with result 0x%x\n", load_pipeline[i].tag, load_pipeline[i].val);
         //Update Reg File
@@ -380,11 +370,11 @@ void complete_mem() {
         reg_file[load_pipeline[i].tag].data = load_pipeline[i].val;
         
         //Update ROB
-        printf("[Complete] Update ROB IA %d finished\n", load_pipeline[i].instr_addr);
+        printf("[Complete] Update ROB IA %d finished\n", load_pipeline[i].ia);
         rob[load_pipeline[i].rob_i].finished = TRUE;
 
         completed_load_buffer[completed_load++] = load_pipeline[i];
-        invalidate_pipeline_entry(&load_pipeline[i]);
+        INVALIDATE_ENTRY(load_pipeline, i);
     }
 }
 
@@ -394,11 +384,11 @@ void complete() {
 }
 
 void issue_alu(int i){
-    int op1 = reg_file[instr_window[i].op1].data;
-    int op2 = reg_file[instr_window[i].op2].data;
+    int op1 = reg_file[instr_window[i].src1].data;
+    int op2 = reg_file[instr_window[i].src2].data;
     int result = -1;
 
-    switch (instr_window[i].instr) {
+    switch (instr_window[i].opcode) {
         case ADD: result = op1 + op2; break;
         case SUB: result = op1 - op2; break;
         case AND: result = op1 & op2; break;
@@ -407,14 +397,13 @@ void issue_alu(int i){
     }
 
     for(int j = 0; j < ALU_PORT_NUM; j++) {
-        if(!alu_pipeline[j].instr_addr) {
-            alu_pipeline[j].instr_addr = instr_window[i].instr_addr;
-            alu_pipeline[j].val = result;
-            alu_pipeline[j].tag = instr_window[i].out_tag;
-            alu_pipeline[j].rob_i = instr_window[i].rob_i;
-            printf("[Issue] issue IA %d to ALU %d with result 0x%x\n", instr_window[i].instr_addr, j, result);
-            break;
-        }
+        if(alu_pipeline[j].ia)
+            continue;
+
+        alu_pipeline[j] = instr_window[i];
+        alu_pipeline[j].val = result;
+        printf("[Issue] issue IA %d to ALU %d with result 0x%x\n", instr_window[i].ia, j, result);
+        break;
     }
 }
 
@@ -430,41 +419,40 @@ int load_forward(int addr) {
 }
 
 void issue_mem(int i){
-    if (instr_window[i].instr == STORE) {
+
+    if (instr_window[i].opcode == STORE) {
         for(int j = 0; j < STORE_PORT_NUM; j++) {
-            if(!store_pipeline[j].instr_addr) {
-                printf("[Issue] issue IA %d to store pipeline %d\n", instr_window[i].instr_addr, j);
-                store_pipeline[j].instr_addr = instr_window[i].instr_addr;
-                store_pipeline[j].val = reg_file[instr_window[i].op1].data;
-                store_pipeline[j].addr = reg_file[instr_window[i].op2].data + instr_window[i].off;
-                store_pipeline[j].tag = -1;
-                store_pipeline[j].rob_i = instr_window[i].rob_i;
-                break;
-            }
+            if(store_pipeline[j].ia)
+               continue; 
+
+            printf("[Issue] issue IA %d to store pipeline %d\n", instr_window[i].ia, j);
+            store_pipeline[j] = instr_window[i];
+            store_pipeline[j].val = reg_file[instr_window[i].src1].data;
+            store_pipeline[j].addr = reg_file[instr_window[i].src2].data + instr_window[i].off;
+            break;
         }
     } else {
         for(int j = 0; j < LOAD_PORT_NUM; j++) {
-            if(!load_pipeline[j].instr_addr) {
-                printf("[Issue] issue IA %d to load pipeline %d\n", instr_window[i].instr_addr, j);
-                load_pipeline[j].instr_addr = instr_window[i].instr_addr;
-                load_pipeline[j].addr = reg_file[instr_window[i].op2].data + instr_window[i].off;
-                load_pipeline[j].val = load_forward(load_pipeline[j].addr);
-                load_pipeline[j].tag = instr_window[i].out_tag;
-                load_pipeline[j].rob_i = instr_window[i].rob_i;
-                break;
-            }
+            if(load_pipeline[j].ia)
+               continue;
+
+            printf("[Issue] issue IA %d to load pipeline %d\n", instr_window[i].ia, j);
+            load_pipeline[j] = instr_window[i];
+            load_pipeline[j].addr = reg_file[instr_window[i].src2].data + instr_window[i].off;
+            load_pipeline[j].val = load_forward(load_pipeline[j].addr);
+            break;
         }
     }
 }
 
 bool is_instr_ready(int i) {
-    bool op1_ready = reg_file[instr_window[i].op1].valid;
-    bool op2_ready = reg_file[instr_window[i].op2].valid;
+    bool op1_ready = reg_file[instr_window[i].src1].valid;
+    bool op2_ready = reg_file[instr_window[i].src2].valid;
 
     if (instr_window[i].ready)
         return TRUE;
 
-    switch (instr_window[i].instr) {
+    switch (instr_window[i].opcode) {
         case LOAD: case STORE: return op2_ready;
         default: return op1_ready && op2_ready;
     }
@@ -479,14 +467,14 @@ void issue() {
 
         if (instr_window[i].ready) {
             if (!old_ready)
-                printf("[Issue] IA %d get ready\n", instr_window[i].instr_addr);
+                printf("[Issue] IA %d get ready\n", instr_window[i].ia);
 
             rob[instr_window[i].rob_i].issued = TRUE;
             
-            if(instr_window[i].instr == STORE && issued_store < STORE_PORT_NUM) {
+            if(instr_window[i].opcode == STORE && issued_store < STORE_PORT_NUM) {
                 issued_store++;
                 issue_mem(i);
-            } else if (instr_window[i].instr == LOAD && issued_load < LOAD_PORT_NUM) {
+            } else if (instr_window[i].opcode == LOAD && issued_load < LOAD_PORT_NUM) {
                 issued_load++;
                 issue_mem(i);
             } else if (issued_alu < ALU_PORT_NUM){
@@ -498,13 +486,22 @@ void issue() {
             }
             // Assuem pipelines are always available
             if (rob[instr_window[i].rob_i].issued) {
-                printf("[Issue] update ROB IA %d issued\n", instr_window[i].instr_addr);
+                printf("[Issue] update ROB IA %d issued\n", instr_window[i].ia);
                 REMOVE_ENTRY(instr_window, i, instr_window_num);
                 instr_window_num--;
                 i--;  
             }
         }       
     }
+}
+
+void insert_rob_entry(int ia, int tag) {
+    printf("[Dispatch] insert IA %d to ROB\n", ia);
+    rob[rob_tail].busy = TRUE;
+    rob[rob_tail].ia = ia;
+    rob[rob_tail].tag = tag;
+    rob_tail = (rob_tail + 1) % ROB_SIZE;
+    rob_size++;
 }
 
 int next_tag() {
@@ -533,46 +530,33 @@ void rename_dispatch() {
     }
 
     int i = instr_window_num;
-    struct instr instr = icache[pc];
     int tag = -1;
 
-    instr_window[i].op1 = instr.type == LOAD ? -1 : front_rat[instr.src1];
-    instr_window[i].op2 = front_rat[instr.src2];
+    instr_window[i] = icache[pc];
+    instr_window[i].src1 = instr_window[i].opcode == LOAD ? -1 : front_rat[instr_window[i].src1];
+    instr_window[i].src2 = front_rat[instr_window[i].src2];
 
-    if (instr.type != STORE) {
+    if (instr_window[i].opcode != STORE) {
         tag = next_tag();
         if(tag == -1) {
             printf("[Rename] reg file full for IA %d\n", pc);
             return;
         }
-        printf("[Rename] allocate Tag %d to IA %d with Reg %d\n", tag, pc, instr.dst);
-        front_rat[instr.dst] = tag;
+        printf("[Rename] allocate Tag %d to IA %d with Reg %d\n", tag, pc, instr_window[i].dst);
+        front_rat[instr_window[i].dst] = tag;
         reg_file[tag].busy = TRUE;
         reg_file[tag].valid = FALSE;
-        reg_file[tag].reg = instr.dst;
+        reg_file[tag].reg = instr_window[i].dst;
     }
 
     printf("[Dispatch] insert IA %d to instruction window\n", pc);
 
-    instr_window[i].out_tag = tag;
-    instr_window[i].off = instr.offset;
-    instr_window[i].instr = instr.type;
-    instr_window[i].instr_addr = pc;
+    instr_window[i].tag = tag;
     instr_window[i].busy = TRUE;
-    instr_window[i].ready = FALSE;
-    instr_window[i].rob_i = rob_tail;
     instr_window[i].ready = is_instr_ready(i);
+    instr_window[i].rob_i = rob_tail;
     instr_window_num++;
-
-    i = rob_tail;
-    rob[i].busy = TRUE;
-    rob[i].finished = FALSE;
-    rob[i].issued = FALSE;
-    rob[i].instr_addr = pc;
-    rob[i].tag = tag;
-    rob[i].s = FALSE;
-    rob_tail = (rob_tail + 1) % ROB_SIZE;
-    rob_size++;
+    insert_rob_entry(pc, tag);
     pc++;
 }
 
@@ -604,19 +588,20 @@ void load_instrs() {
 
     for(int i = 1; i <= instr_num; i++){
         printf("enter instruction: ");
-        char opcode[6] = {0};
+        char opcode[8] = {0};
         scanf("%s ", opcode);
 
-        icache[i].type = parse_opcode(opcode);
+        icache[i].ia = i;
+        icache[i].opcode = parse_opcode(opcode);
 
-        switch (icache[i].type) {
+        switch (icache[i].opcode) {
             case LOAD: {
                 scanf("$%d, ", &icache[i].dst);
-                scanf("%x($%d)", &icache[i].offset, &icache[i].src2);
+                scanf("%x($%d)", &icache[i].off, &icache[i].src2);
             } break;
             case STORE: {
                 scanf("$%d, ", &icache[i].src1);
-                scanf("%x($%d)", &icache[i].offset, &icache[i].src2);
+                scanf("%x($%d)", &icache[i].off, &icache[i].src2);
             } break;
             case ADD: case SUB: case AND: case OR: {
                 scanf("$%d, $%d, $%d", &icache[i].dst, &icache[i].src1, &icache[i].src2);
@@ -624,22 +609,7 @@ void load_instrs() {
             default: printf("Invalid Opcode\n"); return;
         }
     }
-    #ifdef DEBUG
-    for(int i = 1; i <= instr_num; i++){
-        switch (icache[i].type) {
-            case LOAD: {
-                printf("Load instr %s $%d, %#x($%d)\n", "ld", icache[i].dst, icache[i].offset, icache[i].src2);
-            } break;
-            case STORE: {               
-                printf("Load instr %s $%d, %#x($%d)\n", "sb", icache[i].src1, icache[i].offset, icache[i].src2);
-            } break;
-            case ADD: case SUB: case AND: case OR: {
-                printf("Load instr %s $%d, $%d, $%d\n", type_to_str(icache[i].type), icache[i].dst, icache[i].src1, icache[i].src2);
-            } break;
-            default: return;
-        }
-    }
-    #endif
+
     putchar('\n');
 }
 
@@ -657,7 +627,7 @@ void print_reg() {
             printf("%s", SPACE(39));
         }
 
-        struct reg_file_entry e = reg_file[i];
+        struct reg_entry e = reg_file[i];
         printf("%s|%3d|%3d|%#5x|%3d|%3d|\n", SPACE(8), i, e.reg, e.data, e.valid, e.busy);
         printf("%s%s%s%s", SPACE(4), i < RAT_SIZE ? LINE(15) : SPACE(15), SPACE(8), i < RAT_SIZE ? LINE(15) : SPACE(15));    
         printf("%s%s\n",SPACE(8), LINE(24));
@@ -685,7 +655,7 @@ void print_rob() {
     PRINT_ROB_ROW("|  B|", busy);
     PRINT_ROB_ROW("|  I|", issued);
     PRINT_ROB_ROW("|  F|", finished);
-    PRINT_ROB_ROW("| IA|", instr_addr);
+    PRINT_ROB_ROW("| IA|", ia);
     PRINT_ROB_ROW("|TAG|", tag);
     PRINT_ROB_ROW("|  S|", s);
 
@@ -700,9 +670,9 @@ void print_instr_window() {
     printf("%s%s\n", SPACE(8), LINE(35));
 
     for(int i = 0; i < instr_window_num; i++) {
-        struct instr_window_entry e = instr_window[i];
+        struct instr_entry e = instr_window[i];
         printf("%s", SPACE(8));
-        printf("|%2d|%6d|%5s|%3d|%3d|%#4x|%1d|%1d|\n", e.instr_addr, e.out_tag, type_to_str(e.instr), e.op1, e.op2, e.off, e.busy,e.ready);
+        printf("|%2d|%6d|%5s|%3d|%3d|%#4x|%1d|%1d|\n", e.ia, e.tag, type_to_str(e.opcode), e.src1, e.src2, e.off, e.busy,e.ready);
         printf("%s%s\n", SPACE(8), LINE(35));
     }
 
@@ -718,15 +688,15 @@ void print_pipeline() {
         printf("%s|stage|IA|TAG|(Result)|%s|stage|IA|(Addr)|(Data)|%s|stage|IA|TAG|(Addr)|(Data)|\n", SPACE(8), SPACE(8), SPACE(8));
         printf("%s%s%s%s%s%s\n", SPACE(8), LINE(24), SPACE(8), LINE(25), SPACE(8), LINE(29));
 
-        struct pipeline_entry e = alu_pipeline[i];
+        struct instr_entry e = alu_pipeline[i];
         printf("%s", SPACE(8));
-        printf("|%5d|%2d|%3d|%#8x|", 0, e.instr_addr, e.tag, e.val);
+        printf("|%5d|%2d|%3d|%#8x|", 0, e.ia, e.tag, e.val);
         printf("%s", SPACE(8));
         e = store_pipeline[i];
-        printf("|%5d|%2d|%#6x|%#6x|", 0, e.instr_addr, e.addr, e.val);
+        printf("|%5d|%2d|%#6x|%#6x|", 0, e.ia, e.addr, e.val);
         printf("%s", SPACE(8));
         e = load_pipeline[i];
-        printf("|%5d|%2d|%3d|%#6x|%#6x|\n", 0, e.instr_addr, e.tag, e.addr, e.val);
+        printf("|%5d|%2d|%3d|%#6x|%#6x|\n", 0, e.ia, e.tag, e.addr, e.val);
 
         printf("%s%s%s%s%s%s\n", SPACE(8), LINE(24), SPACE(8), LINE(25), SPACE(8), LINE(29));
         putchar('\n');
@@ -747,14 +717,14 @@ void print_mem_and_buffer() {
     for(int i = 0; i < len; i++) {
         printf("%s", i == finished_store ? "Committed " : i == 0 ? "Finished  " :  SPACE(11));
         if (i < STORE_BUF_SIZE) {
-            printf("|%2d|%#4x|%4X|", store_buffer[i].instr_addr, store_buffer[i].val, store_buffer[i].addr);
+            printf("|%2d|%#4x|%#4X|", store_buffer[i].ia, store_buffer[i].val, store_buffer[i].addr);
             printf("%s", SPACE(12));
         } else {
             printf("%s", SPACE(26));
         }
 
         if (i < COMPLETED_LOAD_BUF_SIZE) {
-            printf("|%2d|%9X|", completed_load_buffer[i - 2].instr_addr, completed_load_buffer[i - 2].addr);
+            printf("|%2d|%#9X|", completed_load_buffer[i].ia, completed_load_buffer[i].addr);
             printf("%s", SPACE(13));
         } else {
             printf("%s", SPACE(27));
@@ -792,8 +762,8 @@ void validation() {
         mem_temp[i] = INIT_MEM_VAL(i);
 
     for (int i = 1; i <= instr_num; i++) {
-        int dst = icache[i].dst, src1 = icache[i].src1, src2 = icache[i].src2, off = icache[i].offset;
-        switch (icache[i].type) {
+        int dst = icache[i].dst, src1 = icache[i].src1, src2 = icache[i].src2, off = icache[i].off;
+        switch (icache[i].opcode) {
             case LOAD: reg[dst] = mem_temp[reg[src2] + off - MEM_BASE]; break;
             case STORE: mem_temp[reg[src2] + off - MEM_BASE] = reg[src1]; break;
             case ADD: reg[dst] = reg[src1] + reg[src2]; break;
@@ -842,7 +812,6 @@ void simulate_cycle() {
     
     for (int i = 0; i < MAX_RENAME_DISPATCH; i++) {
         rename_dispatch();
-        rename_dispatch();
     }
 }
 
@@ -857,7 +826,7 @@ int main() {
     int cycle = 0;
 
     while(pc <= instr_num || rob_size != 0) {
-        #ifdef DEBUG
+        #ifndef DEBUG
             system("clear");
             system("clear");
         #endif

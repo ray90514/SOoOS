@@ -9,7 +9,7 @@ run: clean main
 	./SOoOS
 
 debug:
-	gcc -DDEBUG -o SOoOS main.c 
+	gcc -DDEBUG -DVALIDATION -o SOoOS main.c 
 
 clean:
 	rm -f SOoOS
