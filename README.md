@@ -11,7 +11,7 @@ make
 Some configurations are defined as macros.
 
 ```
-2-wide superscalar for rename/dispatch and commit, RAT, icahe size 32
+2-wide superscalar for rename/dispatch and commit, RAT, icahe size 32, flush immediately
 ```
 
 ## Instructions

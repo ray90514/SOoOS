@@ -2,19 +2,15 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define DEBUG
-#define TEST
-#define DEFAULT_VALUE
-
-#ifdef DEBUG
-    #define DEBUG_PRINT(...) do { printf(__VA_ARGS__); } while(0)
-#else
-    #define DEBUG_PRINT(...) do { } while(0)
-#endif                                                                      
-
 typedef char bool;
 #define TRUE 1
 #define FALSE 0
+
+// configurations
+#define DELAY_FLUSH FALSE
+#define MAX_COMMIT 2
+#define MAX_RENAME_DISPATCH 2
+#define MAX_INSTR_NUM 32
 
 #ifdef DEFAULT_VALUE
     int default_reg[] = {0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b};
@@ -29,11 +25,6 @@ typedef char bool;
     #define INIT_MEM_VAL(i) (MEM_VAL_BASE + i)
 #endif
 
-
-#define MAX_COMMIT 2
-#define MAX_RENAME_DISPATCH 2
-#define MAX_INSTR_NUM 32
-
 // default config for RAT version
 #define MEM_BASE 0x80
 #define MEM_SIZE 10
@@ -46,6 +37,12 @@ typedef char bool;
 #define STORE_BUF_SIZE 4
 #define COMPLETED_LOAD_BUF_SIZE 4
 #define INSTR_WINDOW_SIZE 4
+
+#ifdef DEBUG
+    #define DEBUG_PRINT(...) do { printf(__VA_ARGS__); } while(0)
+#else
+    #define DEBUG_PRINT(...) do { } while(0)
+#endif                                                                      
 
 #define INVALID_ENTRY(buf, idx) do {           \
     memset((buf) + (idx), 0, sizeof((buf)[0]));\
@@ -604,7 +601,6 @@ int parse_opcode(char* opcode){
 void load_instrs() {
     printf("number of instructions: ");
     scanf("%d", &instr_num);
-    printf("format: opcode $dst, $src1, $src2 | opcode $op1, offset($op2)\n");
 
     for(int i = 1; i <= instr_num; i++){
         printf("enter instruction: ");
@@ -670,16 +666,16 @@ void print_reg() {
     putchar('\n');
 }
 
-#define PRINT_ROB_ROW(NAME, FIELD) do {          \
-    printf("%s%s", SPACE(8), NAME);              \
-    for(int i = 0; i < ROB_SIZE; i++) {      \
-        if (rob[i].busy)                         \
-            printf("%2d|", rob[i].FIELD);        \
-        else                                     \
-            printf("  |");                       \
-    }                                            \
+#define PRINT_ROB_ROW(NAME, FIELD) do {                    \
+    printf("%s%s", SPACE(8), NAME);                        \
+    for(int i = 0; i < ROB_SIZE; i++) {                    \
+        if (rob[i].busy)                                   \
+            printf("%2d|", rob[i].FIELD);                  \
+        else                                               \
+            printf("  |");                                 \
+    }                                                      \
     printf("\n%s%s\n", SPACE(8), LINE(3 * (ROB_SIZE + 2)));\
-} while(0)                                       \
+} while(0)                                                 \
 
 void print_rob() {
     putchar('\n');
@@ -784,31 +780,7 @@ void print_info() {
     print_mem_and_buffer();
 }
 
-void simulate_cycle(bool delay_flush) {
-    if (should_flush) {
-        flush();
-        should_flush = FALSE;
-        return;
-    }
-
-    retire();
-
-    if (!delay_flush && should_flush) {
-        flush();
-        should_flush = FALSE;
-        return;
-    }
-
-    complete();
-    issue();
-    
-    for (int i = 0; i < MAX_RENAME_DISPATCH; i++) {
-        rename_dispatch();
-        rename_dispatch();
-    }
-}
-
-void test() {
+void validation() {
     flush_committed_store();
     int reg[RAT_SIZE];
     int mem_temp[MEM_SIZE];
@@ -828,7 +800,7 @@ void test() {
             case SUB: reg[dst] = reg[src1] - reg[src2];break;
             case AND: reg[dst] = reg[src1] & reg[src2]; break;
             case OR: reg[dst] = reg[src1] | reg[src2]; break;
-            default: printf("Tests Failed\n"); return;
+            default: printf("Validation Failed\n"); return;
         }  
     }
 
@@ -846,7 +818,32 @@ void test() {
             DEBUG_PRINT("[Debug] mem %d %#x | %#x\n", i, mem_temp[i], mem[i]);
     }
 
-    printf("%s", is_success ? "Tests Passed" : "Test Failed");
+    printf("%s\n", is_success ? "Validation Passed" : "Validation Failed");
+}
+
+void simulate_cycle() {
+    if (should_flush) {
+        flush();
+        should_flush = FALSE;
+        return;
+    }
+
+    retire();
+
+    if (!DELAY_FLUSH && should_flush) {
+        flush();
+        should_flush = FALSE;
+        return;
+    }
+
+    complete();
+
+    issue();
+    
+    for (int i = 0; i < MAX_RENAME_DISPATCH; i++) {
+        rename_dispatch();
+        rename_dispatch();
+    }
 }
 
 int main() {
@@ -856,9 +853,9 @@ int main() {
     printf("press enter to continue..");
     getchar();
     getchar();
+
     int cycle = 0;
-    bool delay_flush = FALSE;
-    bool clear_terminal = TRUE;
+
     while(pc <= instr_num || rob_size != 0) {
         #ifdef DEBUG
             system("clear");
@@ -867,7 +864,7 @@ int main() {
 
         printf("%s\n\n#CYCLE %d, pc = %d\n\n", LINE(64), cycle, pc);
 
-        simulate_cycle(delay_flush);
+        simulate_cycle();
 
         print_info();
 
@@ -880,7 +877,7 @@ int main() {
     printf("%s\n", LINE(64));
     printf("End of Simulation\n");
     
-    #ifdef TEST
-        test();
+    #ifdef VALIDATION
+        validation();
     #endif
 }

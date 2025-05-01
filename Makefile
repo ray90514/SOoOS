@@ -3,9 +3,13 @@
 all: main
 
 main: main.c
-	gcc -o SOoOS main.c
+	gcc -DVALIDATION -o SOoOS main.c
 
 run: clean main
 	./SOoOS
+
+debug:
+	gcc -DDEBUG -o SOoOS main.c 
+
 clean:
 	rm -f SOoOS
